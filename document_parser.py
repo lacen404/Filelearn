@@ -2,6 +2,7 @@
 # 文档读取与预处理模块
 # 依赖安装：
 # pip install langchain langchain-community langchain-text-splitters
+# pip install pytesseract opencv-python pillow numpy
 # document_parser.py
 # 文档读取与预处理模块
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
@@ -9,67 +10,110 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 import os
 import logging
 from typing import List, Optional
+import tempfile
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def read_document(file_path: str) -> List:
+import pytesseract
+import cv2
+import numpy as np
+from PIL import Image
+from io import BytesIO
+
+def read_image(file_content: bytes) -> str:
     """
-    读取文档内容
+    读取图片内容并提取文字信息（OCR实现）
+    
+    依赖:
+        - pip install pytesseract opencv-python pillow numpy
+        - 系统需安装 tesseract-ocr，并确保可在 PATH 中调用
+        - 如需中文支持，安装 chi_sim.traineddata 语言包
+          (macOS: brew install tesseract tesseract-lang)
     
     Args:
-        file_path: 文档文件路径
+        file_content: 图片文件的二进制内容
         
     Returns:
-        str: 文档内容字符串
-        
-    Raises:
-        ValueError: 不支持的文件类型
-        FileNotFoundError: 文件不存在
-        Exception: 其他读取错误
+        str: 识别出的文本内容
     """
-    # 调试：检查文件是否存在
-    if not os.path.exists(file_path):
-        error_msg = f"文件不存在: {file_path}"
-        logger.error(error_msg)
-        raise FileNotFoundError(error_msg)
-    
-    # 获取文件扩展名和文件大小
-    ext = os.path.splitext(file_path)[-1].lower()
-    file_size = os.path.getsize(file_path)
-    
-    logger.info(f"开始读取文件: {file_path}")
-    logger.info(f"文件类型: {ext}, 文件大小: {file_size} 字节")
-    
     try:
+        logger.info("开始读取图片内容并进行OCR识别")
+        # 将二进制数据转换为numpy数组
+        image_array = np.frombuffer(file_content, np.uint8)
+        image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
+        if image is None:
+            logger.error("图像解码失败")
+            return "[图像解码失败]"
+
+        # 转灰度图
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # 二值化提升识别效果
+        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+
+        # 转换为PIL Image以便pytesseract识别
+        pil_image = Image.fromarray(thresh)
+        text = pytesseract.image_to_string(pil_image, lang="chi_sim+eng")
+
+        # 清理多余换行与空白
+        clean_text = "\n".join([line.strip() for line in text.splitlines() if line.strip()])
+        if not clean_text:
+            clean_text = "[未识别出文字]"
+
+        logger.info("OCR识别完成")
+        return clean_text
+
+    except Exception as e:
+        logger.error(f"OCR识别时出错: {e}")
+        return f"[OCR识别出错: {e}]"
+
+def read_document(file_input, file_type: Optional[str] = None) -> str:
+    """
+    读取文档内容，支持文件路径和上传的二进制内容。
+
+    Args:
+        file_input: 文件路径(str) 或 文件字节流(bytes)
+        file_type: 文件类型（扩展名），如 'pdf'、'docx'
+
+    Returns:
+        str: 文档内容文本
+    """
+    try:
+        # 如果传入的是路径
+        if isinstance(file_input, str):
+            file_path = file_input
+        else:
+            # 如果传入的是字节流，写入临时文件
+            suffix = f".{file_type}" if file_type else ""
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            temp_file.write(file_input)
+            temp_file.flush()
+            file_path = temp_file.name
+
+        ext = os.path.splitext(file_path)[-1].lower()
+
         if ext == ".pdf":
-            logger.debug("使用 PyPDFLoader 读取 PDF 文件")
             loader = PyPDFLoader(file_path)
         elif ext in [".doc", ".docx"]:
-            logger.debug("使用 Docx2txtLoader 读取 Word 文档")
             loader = Docx2txtLoader(file_path)
-        elif ext in [".txt", ".py"]:
-            logger.debug("使用 TextLoader 读取文本文件")
+        elif ext in [".txt", ".py", ".java"]:
             loader = TextLoader(file_path, encoding="utf-8")
         else:
-            error_msg = f"不支持的文件类型: {ext}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-        
-        # 加载文档
-        logger.debug("开始加载文档内容...")
+            raise ValueError(f"不支持的文件类型: {ext}")
+
         docs = loader.load()
-        # 文本分块
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200, add_start_index=True)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         splits = text_splitter.split_documents(docs)
-        logger.info(f"拆分为 {len(splits)} 个子文档")
-        return splits
-        
-    except Exception as e:
-        error_msg = f"读取文件时发生错误: {str(e)}"
-        logger.error(error_msg)
-        raise
+        text = "\n".join([doc.page_content for doc in splits])
+        return text
+
+    finally:
+        # 若使用了临时文件则删除
+        if not isinstance(file_input, str) and os.path.exists(file_path):
+            os.remove(file_path)
+
 
 def read_document_with_metadata(file_path: str) -> dict:
     """
